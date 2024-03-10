@@ -158,7 +158,7 @@ impl Display for Version {
 // TODO(tarcieri): reduce coupling to internal fields via `pub(crate)`
 #[cfg_attr(not(feature = "untested"), allow(dead_code))]
 pub struct YubiKey {
-    pub(crate) card: Card,
+    pub(crate) card: CardState,
     pub(crate) name: String,
     pub(crate) pin: Option<CachedPin>,
     pub(crate) version: Version,
@@ -261,27 +261,28 @@ impl YubiKey {
     /// Reconnect to a YubiKey.
     #[cfg(feature = "untested")]
     pub fn reconnect(&mut self) -> Result<()> {
-        info!("trying to reconnect to current reader");
+        todo!()
+        // info!("trying to reconnect to current reader");
 
-        self.card.reconnect(
-            pcsc::ShareMode::Shared,
-            pcsc::Protocols::T1,
-            pcsc::Disposition::ResetCard,
-        )?;
+        // self.card.reconnect(
+        //     pcsc::ShareMode::Shared,
+        //     pcsc::Protocols::T1,
+        //     pcsc::Disposition::ResetCard,
+        // )?;
 
-        let pin = self
-            .pin
-            .as_ref()
-            .map(|p| Buffer::new(p.expose_secret().clone()));
+        // let pin = self
+        //     .pin
+        //     .as_ref()
+        //     .map(|p| Buffer::new(p.expose_secret().clone()));
 
-        let txn = Transaction::new(&mut self.card)?;
-        txn.select_application()?;
+        // let txn = Transaction::new(&mut self.card)?;
+        // txn.select_application()?;
 
-        if let Some(p) = &pin {
-            txn.verify_pin(p)?;
-        }
+        // if let Some(p) = &pin {
+        //     txn.verify_pin(p)?;
+        // }
 
-        Ok(())
+        // Ok(())
     }
 
     /// Disconnect from the YubiKey.
@@ -295,7 +296,7 @@ impl YubiKey {
     /// handle errors or use a different disposition method.
     pub fn disconnect(self, disposition: Disposition) -> core::result::Result<(), (Self, Error)> {
         let Self {
-            card,
+            mut card,
             name,
             pin,
             version,
@@ -305,7 +306,7 @@ impl YubiKey {
         card.disconnect(disposition).map_err(|(card, e)| {
             (
                 Self {
-                    card,
+                    card: CardState::new(card),
                     name,
                     pin,
                     version,
@@ -317,9 +318,9 @@ impl YubiKey {
     }
 
     /// Begin a transaction.
-    pub(crate) fn begin_transaction(&mut self) -> Result<Transaction<'_>> {
+    pub(crate) fn begin_transaction(&mut self) -> Result<&Transaction<'_>> {
         // TODO(tarcieri): reconnect support
-        Transaction::new(&mut self.card)
+        self.card.connect()
     }
 
     /// Get the name of the associated PC/SC card reader.
@@ -735,7 +736,7 @@ impl<'a> TryFrom<&'a Reader<'_>> for YubiKey {
             }
             Ok((version, serial)) => {
                 let yubikey = YubiKey {
-                    card,
+                    card: CardState::new(card),
                     name: String::from(reader.name()),
                     pin: None,
                     version,
@@ -747,3 +748,71 @@ impl<'a> TryFrom<&'a Reader<'_>> for YubiKey {
         }
     }
 }
+
+pub(crate) enum CardState {
+    Empty,
+    Card(Box<Card>),
+    Transaction(TransactionHack),
+}
+
+pub(crate) struct TransactionHack {
+    txn: Transaction<'static>,
+    card: *mut Card,
+}
+
+impl CardState {
+    pub(crate) fn connect(&mut self) -> Result<&Transaction<'static>> {
+        let mut this = std::mem::replace(self, CardState::Empty);
+        if let CardState::Card(card) = this {
+            let card_leaked = Box::leak(card);
+            let card_ptr = card_leaked as _;
+            let txn = Transaction::new(card_leaked)?;
+            this = CardState::Transaction(TransactionHack {
+                txn,
+                card: card_ptr,
+            });
+        }
+        let _ = std::mem::replace(self, this);
+
+        match self {
+            CardState::Empty => unreachable!(),
+            CardState::Card(_) => unreachable!(),
+            CardState::Transaction(TransactionHack { txn, .. }) => Ok(txn),
+        }
+    }
+
+    pub(crate) fn disconnect(
+        mut self,
+        disposition: Disposition,
+    ) -> core::result::Result<(), (Card, pcsc::Error)> {
+        if let CardState::Transaction(hack) = self {
+            let card = hack.reset();
+            self = CardState::Card(card);
+        }
+
+        if let CardState::Card(card) = self {
+            card.disconnect(disposition)
+        } else {
+            unreachable!()
+        }
+    }
+
+    pub(crate) fn new(card: Card) -> Self {
+        Self::Card(Box::new(card))
+    }
+}
+
+impl TransactionHack {
+    pub(crate) fn reset(self) -> Box<Card> {
+        unsafe { Box::from_raw(self.card) }
+    }
+}
+
+impl Drop for TransactionHack {
+    fn drop(&mut self) {
+        let card = unsafe { Box::from_raw(self.card) };
+        drop(card);
+    }
+}
+
+unsafe impl Send for TransactionHack {}
